@@ -1,0 +1,76 @@
+version: "3.9"
+
+services:
+  mongodb:
+    image: mongo:7.0.14
+    container_name: mongodb
+    restart: unless-stopped
+    environment:
+      MONGO_INITDB_ROOT_USERNAME: admin
+      MONGO_INITDB_ROOT_PASSWORD: mongo_secret_123
+      MONGO_INITDB_DATABASE: appdb
+    ports:
+      - "27017:27017"
+    volumes:
+      - mongodb_data:/data/db
+    networks:
+      - db_network
+
+  postgresql:
+    image: postgres:16.4
+    container_name: postgresql
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: admin
+      POSTGRES_PASSWORD: postgres_secret_123
+      POSTGRES_DB: appdb
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgresql_data:/var/lib/postgresql/data
+    networks:
+      - db_network
+
+  mysql:
+    image: mysql:8.4.2
+    container_name: mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: mysql_root_secret_123
+      MYSQL_USER: admin
+      MYSQL_PASSWORD: mysql_secret_123
+      MYSQL_DATABASE: appdb
+    ports:
+      - "3306:3306"
+    volumes:
+      - mysql_data:/var/lib/mysql
+    networks:
+      - db_network
+
+  redis:
+    image: redis:7.2.6
+    container_name: redis
+    restart: unless-stopped
+    command: redis-server --requirepass redis_secret_123
+    environment:
+      REDIS_PASSWORD: redis_secret_123
+    ports:
+      - "6380:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - db_network
+
+volumes:
+  mongodb_data:
+    driver: local
+  postgresql_data:
+    driver: local
+  mysql_data:
+    driver: local
+  redis_data:
+    driver: local
+
+networks:
+  db_network:
+    driver: bridge
