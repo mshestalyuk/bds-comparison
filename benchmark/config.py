@@ -18,7 +18,7 @@ RUNNER_MAX_DATASET = {
 CONNECTIONS = {
     "postgres": {
         "host":     "localhost",
-        "port":     5433,
+        "port":     5432,
         "dbname":   "appdb",
         "user":     "admin",
         "password": "postgres_secret_123",
