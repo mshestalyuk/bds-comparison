@@ -1,11 +1,26 @@
 """
-Main benchmark entry point.
+Main benchmark entry point (expanded for 5.0 grade).
 
 Usage:
-    cd <repo-root>
-    python -m benchmark.run_benchmark [--db postgres,mysql,mongo,redis] [--size 10000,100000,1000000]
+    # Standard run (24 scenarios, 3 attempts)
+    python -m benchmark.run_benchmark
 
-Results are saved to benchmark/results/benchmark_<timestamp>.csv
+    # Only specific databases
+    python -m benchmark.run_benchmark --db postgres,mongo
+
+    # Include denormalized schema comparison (H3 hypothesis)
+    python -m benchmark.run_benchmark --db postgres --denorm
+
+    # Run WITHOUT indexes first, then WITH indexes (comparison)
+    python -m benchmark.run_benchmark --db postgres --index-compare
+
+    # Run EXPLAIN analysis
+    python -m benchmark.run_benchmark --db postgres --explain
+
+    # Large dataset sizes for 5.0
+    python -m benchmark.run_benchmark --size 500000,1000000,10000000
+
+Results are saved to benchmark/results/
 """
 import argparse
 import csv
@@ -20,7 +35,7 @@ from benchmark.config import (
 )
 
 # ---------------------------------------------------------------------------
-# Runner imports — catch missing driver gracefully
+# Runner imports
 # ---------------------------------------------------------------------------
 
 def _load_runners():
@@ -49,6 +64,13 @@ def _load_runners():
     except ImportError as e:
         print(f"[WARN] Redis driver not available: {e}")
 
+    # Denormalized runners
+    try:
+        from benchmark.runners.postgres_denorm_runner import PostgresDenormRunner
+        runners["postgres_denorm"] = PostgresDenormRunner
+    except ImportError as e:
+        print(f"[WARN] PostgreSQL denorm driver not available: {e}")
+
     return runners
 
 
@@ -57,7 +79,7 @@ def _load_runners():
 # ---------------------------------------------------------------------------
 
 def parse_args():
-    p = argparse.ArgumentParser(description="Database CRUD benchmark")
+    p = argparse.ArgumentParser(description="Database CRUD benchmark (24 scenarios)")
     p.add_argument(
         "--db",
         default="postgres,mysql,mongo,redis",
@@ -74,6 +96,26 @@ def parse_args():
         default=ATTEMPTS,
         help=f"Number of attempts per scenario (default {ATTEMPTS})",
     )
+    p.add_argument(
+        "--denorm",
+        action="store_true",
+        help="Also run denormalized schema benchmark (H3 hypothesis)",
+    )
+    p.add_argument(
+        "--index-compare",
+        action="store_true",
+        help="Run benchmark twice: with and without indexes (H1 hypothesis)",
+    )
+    p.add_argument(
+        "--explain",
+        action="store_true",
+        help="Run EXPLAIN ANALYZE on representative queries",
+    )
+    p.add_argument(
+        "--scenarios",
+        default=None,
+        help="Comma-separated scenario IDs to run (default: all 24)",
+    )
     return p.parse_args()
 
 
@@ -88,6 +130,7 @@ CSV_FIELDS = [
     "attempt_1_ms", "attempt_2_ms", "attempt_3_ms",
     "avg_ms", "min_ms", "max_ms",
     "ops_count", "avg_ops_per_sec",
+    "index_mode",  # "with_indexes" or "without_indexes"
 ]
 
 
@@ -102,31 +145,34 @@ def save_results(rows: list, timestamp: str) -> str:
 
 
 def save_summary(rows: list, timestamp: str) -> str:
-    """Save a pivot-style summary: scenario × db, one row per dataset size."""
+    """Pivot-style summary: scenario × db, one row per dataset size."""
     os.makedirs(RESULTS_DIR, exist_ok=True)
     path = os.path.join(RESULTS_DIR, f"summary_{timestamp}.csv")
 
-    # Group: (scenario_id, dataset_size) → {db: avg_ms}
     from collections import defaultdict
     table = defaultdict(dict)
     dbs_seen = []
     for r in rows:
-        key = (r["scenario_id"], r["scenario_name"], r["operation"], r["dataset_size"])
-        db  = r["db"]
+        idx_mode = r.get("index_mode", "with_indexes")
+        key = (r["scenario_id"], r["scenario_name"], r["operation"],
+               r["dataset_size"], idx_mode)
+        db = r["db"]
         table[key][db] = r["avg_ms"]
         if db not in dbs_seen:
             dbs_seen.append(db)
 
-    headers = ["scenario_id", "scenario_name", "operation", "dataset_size"] + dbs_seen
+    headers = ["scenario_id", "scenario_name", "operation",
+               "dataset_size", "index_mode"] + dbs_seen
     with open(path, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=headers)
         writer.writeheader()
-        for (sid, sname, op, size), db_times in sorted(table.items()):
+        for (sid, sname, op, size, imode), db_times in sorted(table.items()):
             row = {
                 "scenario_id":   sid,
                 "scenario_name": sname,
                 "operation":     op,
                 "dataset_size":  size,
+                "index_mode":    imode,
             }
             for db in dbs_seen:
                 row[db] = db_times.get(db, "")
@@ -142,10 +188,16 @@ SEP  = "=" * 68
 SEP2 = "-" * 68
 
 
-def run_benchmark(selected_dbs: list, sizes: list, attempts: int) -> list:
+def run_benchmark(selected_dbs: list, sizes: list, attempts: int,
+                  index_mode: str = "with_indexes",
+                  scenario_filter: list = None) -> list:
     all_runners = _load_runners()
     results     = []
     timestamp   = datetime.now().strftime("%Y%m%d_%H%M%S")
+
+    scenarios = SCENARIOS
+    if scenario_filter:
+        scenarios = [s for s in SCENARIOS if s["id"] in scenario_filter]
 
     for db_name in selected_dbs:
         if db_name not in all_runners:
@@ -165,7 +217,7 @@ def run_benchmark(selected_dbs: list, sizes: list, attempts: int) -> list:
                 continue
 
             print(f"\n{SEP}")
-            print(f"  {db_name.upper():10s} | {dataset_size:>12,} records")
+            print(f"  {db_name.upper():18s} | {dataset_size:>12,} records | {index_mode}")
             print(SEP)
 
             # ---- Setup ------------------------------------------------
@@ -180,11 +232,16 @@ def run_benchmark(selected_dbs: list, sizes: list, attempts: int) -> list:
                 continue
             print(f" done ({time.perf_counter() - t_setup:.1f}s)")
 
+            # ---- Drop indexes if requested ----------------------------
+            if index_mode == "without_indexes" and hasattr(runner, 'drop_extra_indexes'):
+                print(f"  [indexes] dropping non-PK indexes...")
+                runner.drop_extra_indexes()
+
             # ---- Scenarios --------------------------------------------
-            for scenario in SCENARIOS:
+            for scenario in scenarios:
                 sid      = scenario["id"]
                 sname    = scenario["name"]
-                ops_cnt  = SCENARIO_OPS[sid]
+                ops_cnt  = SCENARIO_OPS.get(sid, 1)
                 attempt_times = []
 
                 print(f"\n  {sid} — {sname}")
@@ -197,6 +254,13 @@ def run_benchmark(selected_dbs: list, sizes: list, attempts: int) -> list:
                         runner.after_scenario(sid)
                     except Exception as exc:
                         print(f"    attempt {attempt}: ERROR — {exc}")
+                        traceback.print_exc()
+                        attempt_times.append(None)
+                        continue
+
+                    if t_ms == 0.0:
+                        # Scenario not applicable for this runner
+                        print(f"    attempt {attempt}: N/A (skipped)")
                         attempt_times.append(None)
                         continue
 
@@ -207,7 +271,6 @@ def run_benchmark(selected_dbs: list, sizes: list, attempts: int) -> list:
                         f"({ops_per_sec:>10.1f} ops/s)"
                     )
 
-                # Filter out failed attempts
                 valid = [t for t in attempt_times if t is not None]
                 if not valid:
                     continue
@@ -215,7 +278,6 @@ def run_benchmark(selected_dbs: list, sizes: list, attempts: int) -> list:
                 avg_ms = sum(valid) / len(valid)
                 ops_s  = ops_cnt / avg_ms * 1_000 if avg_ms > 0 else 0
 
-                # Pad to exactly `attempts` slots
                 padded = attempt_times + [None] * (attempts - len(attempt_times))
                 row = {
                     "db":            db_name,
@@ -231,6 +293,7 @@ def run_benchmark(selected_dbs: list, sizes: list, attempts: int) -> list:
                     "max_ms":        round(max(valid), 3),
                     "ops_count":     ops_cnt,
                     "avg_ops_per_sec": round(ops_s, 1),
+                    "index_mode":    index_mode,
                 }
                 results.append(row)
 
@@ -239,6 +302,11 @@ def run_benchmark(selected_dbs: list, sizes: list, attempts: int) -> list:
                     f"min {min(valid):.2f} | max {max(valid):.2f} | "
                     f"{ops_s:.1f} ops/s"
                 )
+
+            # ---- Restore indexes if dropped ---------------------------
+            if index_mode == "without_indexes" and hasattr(runner, 'create_extra_indexes'):
+                print(f"\n  [indexes] recreating indexes...")
+                runner.create_extra_indexes()
 
             # ---- Teardown ---------------------------------------------
             print(f"\n  [teardown] ...", end="", flush=True)
@@ -272,15 +340,70 @@ def _fmt(v):
 # ---------------------------------------------------------------------------
 
 if __name__ == "__main__":
-    args        = parse_args()
-    sel_dbs     = [d.strip() for d in args.db.split(",")]
-    sel_sizes   = [int(s.strip()) for s in args.size.split(",")]
+    args         = parse_args()
+    sel_dbs      = [d.strip() for d in args.db.split(",")]
+    sel_sizes    = [int(s.strip()) for s in args.size.split(",")]
     sel_attempts = args.attempts
+    sel_scenarios = None
+    if args.scenarios:
+        sel_scenarios = [s.strip().upper() for s in args.scenarios.split(",")]
+
+    # Add denorm runners if requested
+    if args.denorm:
+        extra = []
+        for db in sel_dbs:
+            denorm_name = f"{db}_denorm"
+            if denorm_name not in sel_dbs:
+                extra.append(denorm_name)
+        sel_dbs.extend(extra)
 
     print(f"\nBenchmark configuration:")
     print(f"  Databases : {sel_dbs}")
     print(f"  Sizes     : {sel_sizes}")
     print(f"  Attempts  : {sel_attempts} per scenario")
-    print(f"  Scenarios : {len(SCENARIOS)} total\n")
+    print(f"  Scenarios : {len(sel_scenarios) if sel_scenarios else len(SCENARIOS)} total")
+    if args.index_compare:
+        print(f"  Mode      : Index comparison (WITH + WITHOUT)")
+    if args.denorm:
+        print(f"  Mode      : Including denormalized schema (H3 hypothesis)")
+    print()
 
-    run_benchmark(sel_dbs, sel_sizes, sel_attempts)
+    all_results = []
+
+    if args.index_compare:
+        # Run twice: with and without indexes
+        print("\n" + "=" * 70)
+        print("  PHASE 1: WITH INDEXES")
+        print("=" * 70)
+        r1 = run_benchmark(sel_dbs, sel_sizes, sel_attempts,
+                           index_mode="with_indexes",
+                           scenario_filter=sel_scenarios)
+        all_results.extend(r1)
+
+        print("\n" + "=" * 70)
+        print("  PHASE 2: WITHOUT INDEXES")
+        print("=" * 70)
+        r2 = run_benchmark(sel_dbs, sel_sizes, sel_attempts,
+                           index_mode="without_indexes",
+                           scenario_filter=sel_scenarios)
+        all_results.extend(r2)
+
+        # Save combined
+        if all_results:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            p1 = save_results(all_results, f"index_compare_{ts}")
+            p2 = save_summary(all_results, f"index_compare_{ts}")
+            print(f"\n  Combined index comparison saved:")
+            print(f"    detail  → {p1}")
+            print(f"    summary → {p2}")
+    else:
+        run_benchmark(sel_dbs, sel_sizes, sel_attempts,
+                      scenario_filter=sel_scenarios)
+
+    # Run EXPLAIN if requested
+    if args.explain:
+        print("\n" + "=" * 70)
+        print("  EXPLAIN ANALYZE")
+        print("=" * 70)
+        from benchmark.explain_analyzer import main as explain_main
+        explain_main()
