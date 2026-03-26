@@ -1,14 +1,17 @@
 """
-MongoDB benchmark runner — implements all 12 scenarios.
+MongoDB benchmark runner — implements all 24 scenarios.
 """
+import json
 import random
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from datetime import date, datetime
 
-from pymongo import MongoClient, InsertOne, ASCENDING
+from pymongo import MongoClient, ASCENDING
 
 from benchmark.config import CONNECTIONS, BATCH_SIZE
 from benchmark.generate import (
     chunked, contract_for, employee_generator, evaluation_for, pool_employee,
+    _generate_metadata,
 )
 from benchmark.runners.base_runner import BaseRunner
 
@@ -36,6 +39,14 @@ class MongoRunner(BaseRunner):
         self._client = MongoClient(uri)
         self._db = self._client[cfg["db"]]
 
+    def _new_client(self):
+        cfg = CONNECTIONS["mongo"]
+        uri = (
+            f"mongodb://{cfg['user']}:{cfg['password']}"
+            f"@{cfg['host']}:{cfg['port']}/{cfg['db']}?authSource=admin"
+        )
+        return MongoClient(uri)
+
     # ------------------------------------------------------------------
 
     def setup(self, n: int) -> None:
@@ -50,10 +61,10 @@ class MongoRunner(BaseRunner):
         # Departments
         self._db.departments.insert_many(DEPT_DOCS)
 
-        # Employees
+        # Employees (with metadata)
         emp_col = self._db.employees
         all_ids = []
-        gen = employee_generator(n)
+        gen = employee_generator(n, with_metadata=True)
         for batch in chunked(gen, BATCH_SIZE):
             result = emp_col.insert_many(batch)
             all_ids.extend(result.inserted_ids)
@@ -62,6 +73,9 @@ class MongoRunner(BaseRunner):
         emp_col.create_index("email", unique=True)
         emp_col.create_index("department_id")
         emp_col.create_index("status")
+        emp_col.create_index("salary_gross")
+        emp_col.create_index([("last_name", ASCENDING), ("first_name", ASCENDING)])
+        emp_col.create_index("hire_date")
 
         # Contracts
         con_col = self._db.contracts
@@ -69,6 +83,21 @@ class MongoRunner(BaseRunner):
             docs = [contract_for_mongo(eid, i) for i, eid in batch_ids]
             con_col.insert_many(docs)
         con_col.create_index("employee_id")
+        con_col.create_index("status")
+        con_col.create_index("end_date")
+
+        # Evaluations for a sample
+        eval_col = self._db.evaluations
+        sample_for_eval = random.sample(all_ids, min(5_000, n))
+        eval_docs = []
+        for eid in sample_for_eval:
+            ev = evaluation_for(str(eid), str(all_ids[0]), "2024-H2")
+            ev["employee_id"] = eid
+            ev["evaluator_id"] = all_ids[0]
+            eval_docs.append(ev)
+        for batch in chunked(eval_docs, BATCH_SIZE):
+            eval_col.insert_many(batch)
+        eval_col.create_index([("employee_id", ASCENDING), ("period", ASCENDING)])
 
         self._all_ids = all_ids
         self._sample_ids = random.sample(all_ids, min(2_000, n))
@@ -91,6 +120,17 @@ class MongoRunner(BaseRunner):
             self._c_pool = [pool_employee("c2", i) for i in range(10_000)]
         elif scenario_id == "C3":
             self._c_pool = [pool_employee("c3", i) for i in range(50)]
+        elif scenario_id == "C4":
+            self._c_pool = [pool_employee("c4", i, with_metadata=True) for i in range(500)]
+        elif scenario_id == "C5":
+            self._c_pool = [pool_employee("c5", i) for i in range(1_000)]
+        elif scenario_id == "C6":
+            # 250 existing + 250 new
+            existing = [pool_employee("c6", i) for i in range(250)]
+            result = self._db.employees.insert_many(existing)
+            self._pool_ids = list(result.inserted_ids)
+            new = [pool_employee("c6", i + 250) for i in range(250)]
+            self._c_pool = existing + new
 
         elif scenario_id in ("D1", "D2", "D3"):
             count  = 500 if scenario_id in ("D1", "D2") else 50
@@ -98,13 +138,32 @@ class MongoRunner(BaseRunner):
             status = "terminated" if scenario_id == "D2" else "active"
             pool   = [pool_employee(tag, i, status=status) for i in range(count)]
             result = self._db.employees.insert_many(pool)
-            self._pool_ids = result.inserted_ids
+            self._pool_ids = list(result.inserted_ids)
             if scenario_id == "D3":
                 cons = [contract_for_mongo(eid, i) for i, eid in enumerate(self._pool_ids)]
                 self._db.contracts.insert_many(cons)
 
+        elif scenario_id == "D4":
+            pool = [pool_employee("d4", i, with_metadata=True) for i in range(100)]
+            for p in pool:
+                p["metadata"]["remote_eligible"] = True
+            result = self._db.employees.insert_many(pool)
+            self._pool_ids = list(result.inserted_ids)
+
+        elif scenario_id == "D5":
+            pool = [pool_employee("d5", i) for i in range(500)]
+            for p in pool:
+                p["hire_date"] = "2016-01-01"
+            result = self._db.employees.insert_many(pool)
+            self._pool_ids = list(result.inserted_ids)
+
+        elif scenario_id == "D6":
+            pool = [pool_employee("d6", i) for i in range(500)]
+            result = self._db.employees.insert_many(pool)
+            self._pool_ids = list(result.inserted_ids)
+
     def after_scenario(self, scenario_id: str) -> None:
-        if scenario_id in ("C1", "C2", "C3"):
+        if scenario_id in ("C1", "C2", "C3", "C4", "C5", "C6"):
             tag = scenario_id.lower()
             self._db.employees.delete_many({"email": {"$regex": f"^pool_{tag}_"}})
         elif self._pool_ids:
@@ -156,6 +215,44 @@ class MongoRunner(BaseRunner):
                     pass
         return self._now_ms() - t0
 
+    def _run_c4(self) -> float:
+        """Insert with embedded metadata."""
+        col = self._db.employees
+        t0 = self._now_ms()
+        for doc in self._c_pool:
+            col.insert_one(doc)
+        return self._now_ms() - t0
+
+    def _run_c5(self) -> float:
+        """Concurrent inserts from 4 threads."""
+        chunks = list(chunked(self._c_pool, len(self._c_pool) // 4 + 1))
+
+        def _worker(pool_chunk):
+            client = self._new_client()
+            db = client[CONNECTIONS["mongo"]["db"]]
+            for doc in pool_chunk:
+                db.employees.insert_one(doc)
+            client.close()
+
+        t0 = self._now_ms()
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = [executor.submit(_worker, c) for c in chunks]
+            for f in as_completed(futures):
+                f.result()
+        return self._now_ms() - t0
+
+    def _run_c6(self) -> float:
+        """Upsert: update_one with upsert=True."""
+        col = self._db.employees
+        t0 = self._now_ms()
+        for doc in self._c_pool:
+            col.update_one(
+                {"email": doc["email"]},
+                {"$set": doc},
+                upsert=True,
+            )
+        return self._now_ms() - t0
+
     # ---- READ ----
 
     def _run_r1(self) -> float:
@@ -195,6 +292,54 @@ class MongoRunner(BaseRunner):
             list(col.aggregate(pipeline))
         return self._now_ms() - t0
 
+    def _run_r4(self) -> float:
+        """$lookup — JOIN equivalent."""
+        ids = random.choices(self._sample_ids, k=500)
+        col = self._db.employees
+        t0 = self._now_ms()
+        for eid in ids:
+            list(col.aggregate([
+                {"$match": {"_id": eid}},
+                {"$lookup": {
+                    "from": "contracts",
+                    "localField": "_id",
+                    "foreignField": "employee_id",
+                    "as": "contracts",
+                }},
+                {"$lookup": {
+                    "from": "evaluations",
+                    "localField": "_id",
+                    "foreignField": "employee_id",
+                    "as": "evaluations",
+                }},
+                {"$limit": 1},
+            ]))
+        return self._now_ms() - t0
+
+    def _run_r5(self) -> float:
+        """Regex search on last_name."""
+        import re
+        patterns = ["^Kow", "^Now", "^Wis", "^Ziel", "^Lew",
+                     "ski$", "ska$", "icz$", "owski$", "ewski$"]
+        col = self._db.employees
+        t0 = self._now_ms()
+        for _ in range(200):
+            pat = random.choice(patterns)
+            list(col.find({"last_name": {"$regex": pat}}).limit(50))
+        return self._now_ms() - t0
+
+    def _run_r6(self) -> float:
+        """Paginated listing with sort + skip + limit."""
+        col = self._db.employees
+        page_size = 50
+        t0 = self._now_ms()
+        for page in range(100):
+            offset = page * page_size
+            list(col.find().sort([
+                ("last_name", ASCENDING), ("first_name", ASCENDING)
+            ]).skip(offset).limit(page_size))
+        return self._now_ms() - t0
+
     # ---- UPDATE ----
 
     def _run_u1(self) -> float:
@@ -224,6 +369,56 @@ class MongoRunner(BaseRunner):
             {"end_date": {"$lt": today.isoformat()}, "status": "active"},
             {"$set": {"status": "expired"}},
         )
+        return self._now_ms() - t0
+
+    def _run_u4(self) -> float:
+        """Update nested metadata field."""
+        ids = random.choices(self._sample_ids, k=500)
+        col = self._db.employees
+        t0 = self._now_ms()
+        for eid in ids:
+            new_note = f"Updated at benchmark run {random.randint(1, 999)}"
+            col.update_one(
+                {"_id": eid},
+                {"$set": {"metadata.notes": new_note}},
+            )
+        return self._now_ms() - t0
+
+    def _run_u5(self) -> float:
+        """Concurrent updates (disjoint ID sets)."""
+        pool = random.sample(self._all_ids, min(1_000, len(self._all_ids)))
+        chunk_size = len(pool) // 4
+        chunks = [pool[i * chunk_size:(i + 1) * chunk_size] for i in range(4)]
+
+        def _worker(id_chunk):
+            client = self._new_client()
+            db = client[CONNECTIONS["mongo"]["db"]]
+            for eid in id_chunk:
+                new_salary = round(random.uniform(3_500, 25_000), 2)
+                db.employees.update_one(
+                    {"_id": eid}, {"$set": {"salary_gross": new_salary}}
+                )
+            client.close()
+
+        t0 = self._now_ms()
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = [executor.submit(_worker, c) for c in chunks]
+            for f in as_completed(futures):
+                f.result()
+        return self._now_ms() - t0
+
+    def _run_u6(self) -> float:
+        """Multi-collection update: employee status + contract status."""
+        ids = random.choices(self._sample_ids, k=200)
+        emp_col = self._db.employees
+        con_col = self._db.contracts
+        t0 = self._now_ms()
+        for eid in ids:
+            emp_col.update_one({"_id": eid}, {"$set": {"status": "on_leave"}})
+            con_col.update_many(
+                {"employee_id": eid, "status": "active"},
+                {"$set": {"status": "suspended"}},
+            )
         return self._now_ms() - t0
 
     # ---- DELETE ----
@@ -258,13 +453,59 @@ class MongoRunner(BaseRunner):
         self._pool_ids = []
         return self._now_ms() - t0
 
+    def _run_d4(self) -> float:
+        """Delete by metadata condition."""
+        col = self._db.employees
+        t0 = self._now_ms()
+        col.delete_many({
+            "metadata.remote_eligible": True,
+            "email": {"$regex": "^pool_d4_"},
+        })
+        self._pool_ids = []
+        return self._now_ms() - t0
+
+    def _run_d5(self) -> float:
+        """Bulk delete by hire_date."""
+        col = self._db.employees
+        t0 = self._now_ms()
+        col.delete_many({
+            "hire_date": {"$lt": "2017-01-01"},
+            "email": {"$regex": "^pool_d5_"},
+        })
+        self._pool_ids = []
+        return self._now_ms() - t0
+
+    def _run_d6(self) -> float:
+        """Concurrent deletes from 4 threads."""
+        chunk_size = len(self._pool_ids) // 4
+        chunks = [self._pool_ids[i * chunk_size:(i + 1) * chunk_size] for i in range(4)]
+        # Remaining items go to last chunk
+        remainder = self._pool_ids[4 * chunk_size:]
+        if remainder and chunks:
+            chunks[-1] = chunks[-1] + remainder
+
+        def _worker(id_chunk):
+            client = self._new_client()
+            db = client[CONNECTIONS["mongo"]["db"]]
+            for eid in id_chunk:
+                db.employees.delete_one({"_id": eid})
+            client.close()
+
+        t0 = self._now_ms()
+        with ThreadPoolExecutor(max_workers=4) as executor:
+            futures = [executor.submit(_worker, c) for c in chunks]
+            for f in as_completed(futures):
+                f.result()
+        self._pool_ids = []
+        return self._now_ms() - t0
+
 
 # ---------------------------------------------------------------------------
 # Helpers
 # ---------------------------------------------------------------------------
 
 def contract_for_mongo(employee_id, idx: int) -> dict:
-    """Wrap generate.contract_for with MongoDB employee_id (ObjectId or str)."""
-    c = contract_for(0, idx)   # employee_id=0 placeholder
+    """Wrap generate.contract_for with MongoDB employee_id."""
+    c = contract_for(0, idx)
     c["employee_id"] = employee_id
     return c
